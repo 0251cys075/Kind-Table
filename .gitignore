@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+client/node_modules/
+
+# Production builds
+client/dist/
+dist/
+
+# Runtime database
+server/data/*.db*
+server/data/*.sqlite*
+data/*.db*
+data/*.sqlite*
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+*.local
+
+# System & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
