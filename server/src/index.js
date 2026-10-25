@@ -23,6 +23,7 @@ const app = express();
 const server = http.createServer(app);
 
 const PORT = process.env.PORT || 4000;
+const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
 
 // Middleware
 app.use(cors());
@@ -31,11 +32,11 @@ app.use(express.json({ limit: '10mb' })); // Support state backup payloads
 // API Endpoints
 app.use('/api', apiRoutes);
 
-// WebSocket for live alerts
-initWebSocketServer(server);
-
-// Start background expiry cleaner (checks every 5 seconds)
-startExpiryJob(5000);
+// WebSocket and background jobs only in traditional server mode
+if (!isServerless) {
+  initWebSocketServer(server);
+  startExpiryJob(5000);
+}
 
 // Seed initial demo data if database is fresh
 try {
@@ -77,8 +78,10 @@ function startServer(port = PORT) {
 
 function stopServer() {
   return new Promise((resolve) => {
-    stopExpiryJob();
-    closeWebSocketServer();
+    if (!isServerless) {
+      stopExpiryJob();
+      closeWebSocketServer();
+    }
     server.close(() => {
       closeDatabase();
       resolve();
@@ -86,9 +89,10 @@ function stopServer() {
   });
 }
 
-// Auto start if run directly or not disabled
-if (process.env.AUTO_START !== 'false') {
+// Auto start if run directly or not disabled (skip on serverless / Vercel)
+if (!isServerless && process.env.AUTO_START !== 'false') {
   startServer();
 }
 
 export { app, server, startServer, stopServer };
+export default app;

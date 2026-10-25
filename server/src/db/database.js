@@ -4,9 +4,10 @@
  * Guarantees safe atomic claims, immediate audit logging, and exact state backup/restore.
  */
 
-import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   BATCH_STATUS,
@@ -16,69 +17,364 @@ import {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DATA_DIR = path.resolve(__dirname, '../../data');
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+
+// Dynamically check if node:sqlite is available
+let DatabaseSyncClass = null;
+try {
+  const mod = await import('node:sqlite');
+  DatabaseSyncClass = mod.DatabaseSync;
+} catch {
+  DatabaseSyncClass = null;
 }
 
-const DB_FILE = path.join(DATA_DIR, 'kind_table.db');
-const db = new DatabaseSync(DB_FILE);
+let db = null;
 
-import crypto from 'node:crypto';
+if (DatabaseSyncClass) {
+  try {
+    const DATA_DIR = isServerless ? os.tmpdir() : path.resolve(__dirname, '../../data');
+    try {
+      if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+      }
+    } catch {
+      // Ignored if read-only filesystem or exists
+    }
+    const DB_FILE = path.join(DATA_DIR, 'kind_table.db');
+    db = new DatabaseSyncClass(DB_FILE);
+    initSchema(db);
+  } catch (err) {
+    console.warn('[Database] Could not open file SQLite, falling back to in-memory SQLite:', err.message);
+    try {
+      db = new DatabaseSyncClass(':memory:');
+      initSchema(db);
+    } catch {
+      db = null;
+    }
+  }
+}
 
-// Initialize schema
-db.exec(`
-  PRAGMA journal_mode = WAL;
+if (!db) {
+  console.warn('[Database] Using high-performance in-memory database adapter (compatible with all Node versions and serverless hosts).');
+  db = createInMemoryDb();
+}
 
-  CREATE TABLE IF NOT EXISTS batches (
-    id TEXT PRIMARY KEY,
-    donor TEXT NOT NULL,
-    category TEXT NOT NULL,
-    quantity INTEGER NOT NULL,
-    location TEXT NOT NULL,
-    expiry_time TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'Available',
-    claimed_by TEXT,
-    claimed_at TEXT,
-    created_at TEXT NOT NULL,
-    is_demo INTEGER DEFAULT 0,
-    latitude REAL DEFAULT 40.7128,
-    longitude REAL DEFAULT -74.0060
-  );
+function initSchema(database) {
+  try {
+    database.exec(`
+      PRAGMA journal_mode = WAL;
 
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    email TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    name TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'donor',
-    phone TEXT,
-    organization TEXT,
-    default_location TEXT,
-    latitude REAL DEFAULT 40.7128,
-    longitude REAL DEFAULT -74.0060,
-    created_at TEXT NOT NULL
-  );
+      CREATE TABLE IF NOT EXISTS batches (
+        id TEXT PRIMARY KEY,
+        donor TEXT NOT NULL,
+        category TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        location TEXT NOT NULL,
+        expiry_time TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'Available',
+        claimed_by TEXT,
+        claimed_at TEXT,
+        created_at TEXT NOT NULL,
+        is_demo INTEGER DEFAULT 0,
+        latitude REAL DEFAULT 40.7128,
+        longitude REAL DEFAULT -74.0060
+      );
 
-  CREATE TABLE IF NOT EXISTS audit_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,
-    action TEXT NOT NULL,
-    batch_id TEXT NOT NULL,
-    actor TEXT NOT NULL,
-    details TEXT NOT NULL,
-    raw_line TEXT NOT NULL
-  );
-`);
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'donor',
+        phone TEXT,
+        organization TEXT,
+        default_location TEXT,
+        latitude REAL DEFAULT 40.7128,
+        longitude REAL DEFAULT -74.0060,
+        created_at TEXT NOT NULL
+      );
 
-// Ensure migration for existing tables if columns missing
-try {
-  db.exec(`ALTER TABLE batches ADD COLUMN latitude REAL DEFAULT 40.7128;`);
-} catch (e) { /* column exists */ }
-try {
-  db.exec(`ALTER TABLE batches ADD COLUMN longitude REAL DEFAULT -74.0060;`);
-} catch (e) { /* column exists */ }
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        action TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        details TEXT NOT NULL,
+        raw_line TEXT NOT NULL
+      );
+    `);
+
+    try {
+      database.exec(`ALTER TABLE batches ADD COLUMN latitude REAL DEFAULT 40.7128;`);
+    } catch { /* column exists */ }
+    try {
+      database.exec(`ALTER TABLE batches ADD COLUMN longitude REAL DEFAULT -74.0060;`);
+    } catch { /* column exists */ }
+  } catch (err) {
+    console.warn('[Database] initSchema error:', err.message);
+  }
+}
+
+function createInMemoryDb() {
+  let batches = [];
+  let users = [];
+  let auditLogs = [];
+  let nextBatchRowId = 1;
+  let nextLogId = 1;
+
+  return {
+    exec(sql) {
+      if (sql.includes('DELETE FROM batches')) batches = [];
+      if (sql.includes('DELETE FROM audit_logs')) auditLogs = [];
+    },
+    prepare(sql) {
+      const trimmed = sql.trim();
+
+      if (trimmed.startsWith('INSERT INTO audit_logs')) {
+        return {
+          run(timestamp, action, batch_id, actor, details, raw_line) {
+            const entry = {
+              id: nextLogId++,
+              timestamp,
+              action,
+              batch_id,
+              actor,
+              details,
+              raw_line,
+            };
+            auditLogs.push(entry);
+            return { changes: 1 };
+          },
+        };
+      }
+
+      if (trimmed.includes('FROM audit_logs')) {
+        if (trimmed.includes('ORDER BY id DESC')) {
+          return { all: () => [...auditLogs].reverse() };
+        }
+        return { all: () => [...auditLogs] };
+      }
+
+      if (trimmed.startsWith('INSERT INTO batches')) {
+        return {
+          run(id, donor, category, quantity, location, expiry_time, status, created_at, is_demo, latitude, longitude) {
+            batches.push({
+              rowid: nextBatchRowId++,
+              id,
+              donor,
+              category,
+              quantity,
+              location,
+              expiry_time,
+              status,
+              claimed_by: null,
+              claimed_at: null,
+              created_at,
+              is_demo: is_demo ? 1 : 0,
+              latitude: latitude != null ? latitude : 40.7128,
+              longitude: longitude != null ? longitude : -74.0060,
+            });
+            return { changes: 1 };
+          },
+        };
+      }
+
+      if (trimmed.includes('SELECT id FROM batches ORDER BY rowid DESC')) {
+        return {
+          get: () => (batches.length ? { id: batches[batches.length - 1].id } : null),
+        };
+      }
+
+      if (trimmed === 'SELECT * FROM batches WHERE id = ?') {
+        return {
+          get: (id) => batches.find((b) => b.id === id) || null,
+        };
+      }
+
+      if (trimmed.includes("SET status = 'Claimed'") && trimmed.includes("status = 'Available'")) {
+        return {
+          run(claimedBy, claimedAt, batchId) {
+            const batch = batches.find((b) => b.id === batchId && b.status === 'Available');
+            if (!batch) return { changes: 0 };
+            batch.status = 'Claimed';
+            batch.claimed_by = claimedBy;
+            batch.claimed_at = claimedAt;
+            return { changes: 1 };
+          },
+        };
+      }
+
+      if (trimmed.includes("UPDATE batches SET status = 'Expired'")) {
+        return {
+          run(batchId) {
+            const batch = batches.find((b) => b.id === batchId);
+            if (batch) batch.status = 'Expired';
+            return { changes: 1 };
+          },
+        };
+      }
+
+      if (trimmed.startsWith('SELECT * FROM batches WHERE 1=1')) {
+        return {
+          all: (...params) => {
+            let res = [...batches];
+            if (params.length === 1 && params[0]) {
+              res = res.filter((b) => b.status === params[0] || b.category === params[0]);
+            } else if (params.length === 2) {
+              if (params[0]) res = res.filter((b) => b.status === params[0]);
+              if (params[1]) res = res.filter((b) => b.category === params[1]);
+            }
+            res.sort((a, b) => new Date(a.expiry_time).getTime() - new Date(b.expiry_time).getTime());
+            return res;
+          },
+        };
+      }
+
+      if (trimmed.includes("WHERE status = 'Available'") && trimmed.includes('ORDER BY expiry_time')) {
+        return {
+          all: () => {
+            return batches
+              .filter((b) => b.status === 'Available')
+              .sort((a, b) => new Date(a.expiry_time).getTime() - new Date(b.expiry_time).getTime());
+          },
+        };
+      }
+
+      if (trimmed.includes("status = 'Available' AND expiry_time <= ?")) {
+        return {
+          all: (nowIso) => {
+            const now = new Date(nowIso).getTime();
+            return batches.filter((b) => b.status === 'Available' && new Date(b.expiry_time).getTime() <= now);
+          },
+        };
+      }
+
+      if (trimmed.includes("WHERE status = 'Available'") && trimmed.includes('coalesce(sum(quantity)')) {
+        return {
+          get: () => {
+            const avail = batches.filter((b) => b.status === 'Available');
+            const portions = avail.reduce((sum, b) => sum + (b.quantity || 0), 0);
+            return { count: avail.length, portions };
+          },
+        };
+      }
+
+      if (trimmed.includes("WHERE status = 'Claimed'") && trimmed.includes('coalesce(sum(quantity)')) {
+        return {
+          get: () => {
+            const claimed = batches.filter((b) => b.status === 'Claimed');
+            const portions = claimed.reduce((sum, b) => sum + (b.quantity || 0), 0);
+            return { count: claimed.length, portions };
+          },
+        };
+      }
+
+      if (trimmed.includes("WHERE status = 'Expired'") && trimmed.includes('count(*)')) {
+        return {
+          get: () => ({ count: batches.filter((b) => b.status === 'Expired').length }),
+        };
+      }
+
+      if (trimmed === 'SELECT count(*) as count FROM batches') {
+        return {
+          get: () => ({ count: batches.length }),
+        };
+      }
+
+      if (trimmed.includes('SELECT * FROM batches ORDER BY rowid')) {
+        return { all: () => [...batches] };
+      }
+
+      if (trimmed.includes('WHERE is_demo = 1')) {
+        if (trimmed.startsWith('SELECT count(*)')) {
+          return { get: () => ({ count: batches.filter((b) => b.is_demo === 1).length }) };
+        }
+        if (trimmed.startsWith('SELECT id')) {
+          return { all: () => batches.filter((b) => b.is_demo === 1).map((b) => ({ id: b.id })) };
+        }
+        if (trimmed.startsWith('DELETE FROM batches')) {
+          return {
+            run: () => {
+              const prev = batches.length;
+              batches = batches.filter((b) => b.is_demo !== 1);
+              return { changes: prev - batches.length };
+            },
+          };
+        }
+      }
+
+      if (trimmed.startsWith('INSERT INTO users')) {
+        return {
+          run(id, email, password_hash, name, role, phone, organization, default_location, latitude, longitude, created_at) {
+            users.push({
+              id,
+              email,
+              password_hash,
+              name,
+              role,
+              phone,
+              organization,
+              default_location,
+              latitude,
+              longitude,
+              created_at,
+            });
+            return { changes: 1 };
+          },
+        };
+      }
+
+      if (trimmed.includes('FROM users WHERE LOWER(email) = ?')) {
+        return {
+          get: (email) => users.find((u) => u.email.toLowerCase() === String(email).toLowerCase()) || null,
+        };
+      }
+
+      if (trimmed.includes('FROM users WHERE id = ?')) {
+        return {
+          get: (id) => users.find((u) => u.id === id) || null,
+        };
+      }
+
+      if (trimmed.includes('FROM users ORDER BY created_at')) {
+        return {
+          all: () => [...users].reverse(),
+        };
+      }
+
+      if (trimmed.includes('SELECT count(*) as count FROM users')) {
+        return {
+          get: () => ({ count: users.length }),
+        };
+      }
+
+      if (trimmed.startsWith('UPDATE users SET name = ?')) {
+        return {
+          run(name, phone, org, loc, lat, lon, id) {
+            const u = users.find((user) => user.id === id);
+            if (u) {
+              u.name = name;
+              u.phone = phone;
+              u.organization = org;
+              u.default_location = loc;
+              u.latitude = lat;
+              u.longitude = lon;
+            }
+            return { changes: u ? 1 : 0 };
+          },
+        };
+      }
+
+      return {
+        run: () => ({ changes: 0 }),
+        get: () => null,
+        all: () => [],
+      };
+    },
+  };
+}
 
 /**
  * Format timestamp as HH:MM:SS for log line

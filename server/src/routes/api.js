@@ -11,6 +11,7 @@ import {
   getBatchById,
   createBatch,
   claimBatchAtomic,
+  checkAndExpireBatches,
   getStats,
   getAuditLogs,
   getAuditLogsText,
@@ -46,6 +47,9 @@ const router = Router();
 // 1. Get all batches (with optional category and status filters, and optional distance calculation)
 router.get('/batches', (req, res) => {
   try {
+    if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+      try { checkAndExpireBatches(); } catch (_) {}
+    }
     const { status, category, lat, lng } = req.query;
     let batches = getAllBatches({ status, category });
     if (lat && lng && !isNaN(Number(lat)) && !isNaN(Number(lng))) {
@@ -65,6 +69,9 @@ router.get('/batches', (req, res) => {
 // 2. Get available batches only, sorted by urgency (earliest expiry first, with optional distance)
 router.get('/batches/available', (req, res) => {
   try {
+    if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+      try { checkAndExpireBatches(); } catch (_) {}
+    }
     const { lat, lng } = req.query;
     let batches = getAvailableBatches();
     if (lat && lng && !isNaN(Number(lat)) && !isNaN(Number(lng))) {
